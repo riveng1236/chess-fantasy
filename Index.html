@@ -1,1 +1,561 @@
+// ============================================================
+// Chess Fantasy — Game Orchestrator (UI + rules glue)
+// Depends on: chess.js, cards.js, ai.js (all loaded as globals)
+// ============================================================
 
+const ChessAPI = { WHITE, BLACK, otherColor, cloneState, allLegalMoves, isInCheck, legalMovesForSquare };
+
+let G = null;        // authoritative game state
+let UI = {            // ephemeral UI/selection state
+  selected: null,
+  legalMoves: [],
+  selectedCardIndex: null,
+  cardTargetStage: [],
+  reviveChosenPiece: null,
+  chosenDiff: null,
+  chosenSide: null,
+};
+let pendingMove = null;
+
+// ---------- small helpers ----------
+function labelColor(c) { return c === WHITE ? 'White' : 'Black'; }
+function pieceTypeName(t) { return { p: 'Pawn', n: 'Knight', b: 'Bishop', r: 'Rook', q: 'Queen', k: 'King' }[t]; }
+function squareName(r, c) { return 'abcdefgh'[c] + (8 - r); }
+function pieceGlyph(piece) {
+  const W = { p: '♙', n: '♘', b: '♗', r: '♖', q: '♕', k: '♔' };
+  const B = { p: '♟', n: '♞', b: '♝', r: '♜', q: '♛', k: '♚' };
+  return piece.color === WHITE ? W[piece.type] : B[piece.type];
+}
+function getViewerColor() { return G.mode === '2p' ? G.turn : G.humanColor; }
+function isHumanControlled(color) { return G.mode === '2p' ? true : (color === G.humanColor); }
+function ownPieces(color) {
+  const out = [];
+  for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++) {
+    const p = G.board[r][c];
+    if (p && p.color === color) out.push({ r, c });
+  }
+  return out;
+}
+function territorySquares(color) {
+  const rows = color === WHITE ? [6, 7] : [0, 1];
+  const out = [];
+  for (const r of rows) for (let c = 0; c < 8; c++) out.push({ r, c });
+  return out;
+}
+function neighborsOf(r, c) {
+  const out = [];
+  for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+    if (dr === 0 && dc === 0) continue;
+    const nr = r + dr, nc = c + dc;
+    if (inBounds(nr, nc)) out.push({ r: nr, c: nc });
+  }
+  return out;
+}
+function hasAdjacentEmpty(r, c) { return neighborsOf(r, c).some(s => !G.board[s.r][s.c]); }
+function pieceWeight(t) { return { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 }[t] || 0; }
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+function pieceStillAt(sq, id) { const p = G.board[sq.r][sq.c]; return p && p.id === id; }
+
+function logPublic(text) { G.log.push({ text, vis: 'public' }); }
+function logPrivate(color, text) { G.log.push({ text, vis: 'private:' + color }); }
+
+function toast(msg) {
+  const c = document.getElementById('toast-container');
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.textContent = msg;
+  c.appendChild(t);
+  setTimeout(() => t.remove(), 2800);
+}
+
+function showModal(id) { document.getElementById(id).classList.remove('hidden'); }
+function hideModal(id) { document.getElementById(id).classList.add('hidden'); }
+function showScreen(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+
+// ---------- game lifecycle ----------
+function newGame(mode) {
+  const side = UI.chosenSide || WHITE;
+  G = {
+    board: createInitialBoard(),
+    enPassant: null,
+    turn: WHITE,
+    phase: 'card',
+    mode,
+    humanColor: side,
+    aiColor: otherColor(side),
+    aiDifficulty: UI.chosenDiff || 'medium',
+    capturePoints: { w: 0, b: 0 },
+    captured: { w: [], b: [] },
+    hands: { w: drawInitialHand(6), b: drawInitialHand(6) },
+    traps: [],
+    darkZones: [],
+    cardUsedThisTurn: false,
+    lastMove: null,
+    forcedKingPressure: null,
+    log: [],
+    gameOver: false,
+    winner: null,
+  };
+  UI.selected = null; UI.legalMoves = []; UI.selectedCardIndex = null;
+  UI.cardTargetStage = []; UI.reviveChosenPiece = null;
+  onTurnStart(WHITE);
+  logPublic('⚔️ A new match of Chess Fantasy begins!');
+  showScreen('screen-game');
+  render();
+  if (mode === 'ai' && G.turn === G.aiColor) scheduleAITurn();
+}
+
+function onTurnStart(color) {
+  for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++) {
+    const p = G.board[r][c];
+    if (p && p.color === color) {
+      p.isFrozenThisTurn = false;
+      if (p.frozenTurns > 0) { p.isFrozenThisTurn = true; p.frozenTurns--; }
+      if (p.shieldTurns > 0) p.shieldTurns--;
+      if (p.eyeTurnsLeft > 0) p.eyeTurnsLeft--;
+      if (p.controlledTurnsLeft > 0) {
+        p.controlledTurnsLeft--;
+        if (p.controlledTurnsLeft === 0) { p.color = p.originalColor; p.originalColor = null; }
+      }
+    }
+  }
+  G.phase = 'card';
+  G.cardUsedThisTurn = false;
+}
+
+function checkGameEnd(color) {
+  if (isCheckmate(G, color)) {
+    G.gameOver = true; G.winner = otherColor(color);
+    logPublic(`♚ Checkmate! ${labelColor(otherColor(color))} wins!`);
+    render();
+    showGameOver(`${labelColor(otherColor(color))} wins by checkmate!`);
+    return true;
+  }
+  if (isStalemate(G, color)) {
+    G.gameOver = true; G.winner = null;
+    logPublic('Stalemate — the game is a draw.');
+    render();
+    showGameOver('Stalemate — the game is a draw.');
+    return true;
+  }
+  return false;
+}
+
+function showGameOver(text) {
+  document.getElementById('gameover-text').textContent = text;
+  showModal('modal-gameover');
+}
+
+function switchTurn() {
+  G.turn = otherColor(G.turn);
+  onTurnStart(G.turn);
+  render();
+  if (checkGameEnd(G.turn)) return;
+  if (G.mode === '2p') {
+    showPassScreen(G.turn);
+  } else if (G.turn === G.aiColor) {
+    scheduleAITurn();
+  }
+}
+
+function showPassScreen(color) {
+  document.getElementById('pass-title').textContent = `Pass to ${labelColor(color)}`;
+  showScreen('screen-pass');
+}
+
+function finishMoveAndEndTurn() {
+  UI.selected = null; UI.legalMoves = [];
+  if (G.forcedKingPressure && G.forcedKingPressure.color === G.turn) {
+    G.forcedKingPressure = null;
+  }
+  switchTurn();
+}
+
+// ---------- capture / draw ----------
+function drawCard(color) { G.hands[color].push(weightedDraw()); }
+function awardCapture(color, type) {
+  G.capturePoints[color] += captureValue(type);
+  while (G.capturePoints[color] >= 5) {
+    G.capturePoints[color] -= 5;
+    drawCard(color);
+    logPublic(`✨ ${labelColor(color)} reached 5 Capture Points and drew a new card!`);
+  }
+}
+
+// ---------- trap / dark-zone triggers ----------
+function aiRejectProb(diff) { return { easy: 0.3, medium: 0.6, hard: 0.9 }[diff] || 0.5; }
+function handIncludes(color, key) { return G.hands[color].includes(key); }
+function removeCardFromHand(color, key) {
+  const idx = G.hands[color].indexOf(key);
+  if (idx >= 0) G.hands[color].splice(idx, 1);
+}
+
+function offerRejectBarrier(victimColor, message) {
+  if (!handIncludes(victimColor, 'rejectBarrier')) return false;
+  let used = false;
+  if (isHumanControlled(victimColor)) {
+    used = window.confirm(message + '\n\nUse your Reject Barrier card to cancel this effect?');
+  } else {
+    used = Math.random() < aiRejectProb(G.aiDifficulty);
+  }
+  if (used) {
+    removeCardFromHand(victimColor, 'rejectBarrier');
+    logPublic('🚫 Reject Barrier cancelled the effect!');
+    toast('Reject Barrier cancelled the effect!');
+  }
+  return used;
+}
+
+function checkCardSquareTrigger(r, c, piece) {
+  const trap = G.traps.find(t => t.r === r && t.c === c && t.owner !== piece.color && !t.revealed);
+  if (trap) { handleTrapTrigger(trap, piece); return; }
+  const zone = G.darkZones.find(z => z.r === r && z.c === c && z.owner !== piece.color && !z.revealed);
+  if (zone) handleDarkZoneTrigger(zone, piece);
+}
+
+function handleTrapTrigger(trap, piece) {
+  trap.revealed = true;
+  logPublic(`💥 A hidden Trap is revealed at ${squareName(trap.r, trap.c)}!`);
+  toast('A hidden Trap was revealed!');
+  const cancel = offerRejectBarrier(piece.color, `An enemy Trap was revealed under your ${pieceTypeName(piece.type)}!`);
+  if (!cancel) {
+    piece.frozenTurns = 1;
+    logPublic(`${labelColor(piece.color)}'s ${pieceTypeName(piece.type)} is frozen for 1 turn.`);
+  }
+  G.traps = G.traps.filter(t => t !== trap);
+}
+
+function handleDarkZoneTrigger(zone, piece) {
+  zone.revealed = true;
+  logPublic(`🌑 A Dark Arcane zone is revealed at ${squareName(zone.r, zone.c)}!`);
+  toast('A Dark Arcane zone was revealed!');
+  const cancel = offerRejectBarrier(piece.color, `A Dark Arcane zone was revealed under your ${pieceTypeName(piece.type)}!`);
+  if (!cancel) {
+    piece.originalColor = piece.color;
+    piece.color = zone.owner;
+    piece.controlledTurnsLeft = 2;
+    logPublic(`${labelColor(zone.owner)} seizes control of the ${pieceTypeName(piece.type)} for 2 turns!`);
+  }
+  G.darkZones = G.darkZones.filter(z => z !== zone);
+}
+
+// ---------- card playability & targeting ----------
+function canPlayCard(color, cardKey) {
+  switch (cardKey) {
+    case 'kingPressure': {
+      const opp = otherColor(color);
+      const kp = findKing(G.board, opp);
+      if (!kp) return false;
+      return legalMovesForSquare(G, kp.r, kp.c).length > 0;
+    }
+    case 'revive':
+      return G.captured[color].length > 0 && territorySquares(color).some(s => !G.board[s.r][s.c]);
+    case 'rewind':
+      return !!(G.lastMove && G.lastMove.color === color && pieceStillAt(G.lastMove.to, G.lastMove.pieceId));
+    case 'rejectBarrier':
+      return false; // reactive-only card
+    case 'teleport':
+      return ownPieces(color).length >= 2;
+    case 'quickMove':
+      return ownPieces(color).some(p => !G.board[p.r][p.c].isFrozenThisTurn && hasAdjacentEmpty(p.r, p.c));
+    default:
+      return true;
+  }
+}
+
+function isValidCardTarget(color, cardKey, stage, r, c) {
+  const def = CARD_BY_KEY[cardKey];
+  const piece = G.board[r][c];
+  switch (def.targetType) {
+    case 'emptySquare': return !piece;
+    case 'ownPiece': return !!piece && piece.color === color && !piece.isFrozenThisTurn;
+    case 'quickMove':
+      if (stage.length === 0) return !!piece && piece.color === color && !piece.isFrozenThisTurn && hasAdjacentEmpty(r, c);
+      {
+        const o = stage[0];
+        const dr = Math.abs(r - o.r), dc = Math.abs(c - o.c);
+        return !piece && dr <= 1 && dc <= 1 && (dr + dc) > 0;
+      }
+    case 'twoOwnPieces':
+      if (stage.some(s => s.r === r && s.c === c)) return false;
+      return !!piece && piece.color === color && !piece.isFrozenThisTurn;
+    case 'rewindPiece':
+      return !!(G.lastMove && G.lastMove.color === color && r === G.lastMove.to.r && c === G.lastMove.to.c &&
+        pieceStillAt(G.lastMove.to, G.lastMove.pieceId));
+    case 'reviveTarget':
+      return !!UI.reviveChosenPiece && !piece && isInTerritory(r, color);
+    default: return false;
+  }
+}
+
+function computeCardTargetHints() {
+  if (UI.selectedCardIndex == null) return [];
+  const color = G.turn;
+  const cardKey = G.hands[color][UI.selectedCardIndex];
+  if (!cardKey) return [];
+  const out = [];
+  for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++) {
+    if (isValidCardTarget(color, cardKey, UI.cardTargetStage, r, c)) out.push({ r, c });
+  }
+  return out;
+}
+
+function isTargetComplete() {
+  if (UI.selectedCardIndex == null) return false;
+  const cardKey = G.hands[G.turn][UI.selectedCardIndex];
+  const def = CARD_BY_KEY[cardKey];
+  switch (def.targetType) {
+    case 'emptySquare': case 'ownPiece': case 'rewindPiece': case 'reviveTarget':
+      return UI.cardTargetStage.length === 1;
+    case 'quickMove': case 'twoOwnPieces':
+      return UI.cardTargetStage.length === 2;
+    case 'none':
+      return true;
+    default: return false;
+  }
+}
+
+// ---------- applying card effects ----------
+function applyQuickMove(from, to) {
+  const piece = G.board[from.r][from.c];
+  piece.prevSquare = { r: from.r, c: from.c };
+  G.board[from.r][from.c] = null;
+  G.board[to.r][to.c] = piece;
+  piece.hasMoved = true;
+  G.lastMove = { pieceId: piece.id, color: piece.color, from, to };
+  checkCardSquareTrigger(to.r, to.c, piece);
+}
+
+function applyCardEffect(color, cardKey, targets) {
+  switch (cardKey) {
+    case 'trap': {
+      const { r, c } = targets[0];
+      G.traps.push({ r, c, owner: color, revealed: false });
+      logPrivate(color, `You set a Trap at ${squareName(r, c)}.`);
+      break;
+    }
+    case 'darkArcane': {
+      const { r, c } = targets[0];
+      G.darkZones.push({ r, c, owner: color, revealed: false });
+      logPrivate(color, `You placed a Dark Arcane zone at ${squareName(r, c)}.`);
+      break;
+    }
+    case 'quickMove': {
+      const [from, to] = targets;
+      applyQuickMove(from, to);
+      logPrivate(color, `You used Quick Move: ${squareName(from.r, from.c)} → ${squareName(to.r, to.c)}.`);
+      break;
+    }
+    case 'arcaneShield': {
+      const { r, c } = targets[0];
+      const piece = G.board[r][c];
+      piece.shieldTurns = 3;
+      logPrivate(color, `You cast Arcane Shield on your ${pieceTypeName(piece.type)} at ${squareName(r, c)}.`);
+      break;
+    }
+    case 'eyesSeeAll': {
+      const { r, c } = targets[0];
+      const piece = G.board[r][c];
+      piece.eyeTurnsLeft = 3;
+      logPrivate(color, `You granted Eyes See All to your ${pieceTypeName(piece.type)} at ${squareName(r, c)}.`);
+      break;
+    }
+    case 'teleport': {
+      const [a, b] = targets;
+      const pa = G.board[a.r][a.c], pb = G.board[b.r][b.c];
+      G.board[a.r][a.c] = pb; G.board[b.r][b.c] = pa;
+      logPrivate(color, `You teleported pieces between ${squareName(a.r, a.c)} and ${squareName(b.r, b.c)}.`);
+      break;
+    }
+    case 'rewind': {
+      const sq = targets[0];
+      const piece = G.board[sq.r][sq.c];
+      const from = G.lastMove.from;
+      G.board[from.r][from.c] = piece;
+      G.board[sq.r][sq.c] = null;
+      logPrivate(color, `You rewound your ${pieceTypeName(piece.type)} back to ${squareName(from.r, from.c)}.`);
+      G.lastMove = null;
+      break;
+    }
+    case 'revive': {
+      const { r, c } = targets[0];
+      const rec = UI.reviveChosenPiece;
+      G.captured[color] = G.captured[color].filter(p => p.id !== rec.id);
+      const np = makePiece(rec.type, color);
+      G.board[r][c] = np;
+      logPrivate(color, `You revived a ${pieceTypeName(rec.type)} at ${squareName(r, c)}.`);
+      break;
+    }
+    case 'kingPressure': {
+      const opp = otherColor(color);
+      G.forcedKingPressure = { color: opp };
+      logPrivate(color, `You unleashed King Pressure on the enemy King!`);
+      logPublic(`⚡ ${labelColor(opp)}'s King is under forced Check!`);
+      break;
+    }
+  }
+}
+
+// ---------- move execution ----------
+function tryMakeMove(move) {
+  if (move.promotion && !move.promoType) {
+    if (isHumanControlled(G.turn)) { pendingMove = move; showPromotionModal(); return; }
+    move.promoType = 'q';
+  }
+  commitMove(move);
+}
+
+function commitMove(move) {
+  const color = G.turn;
+  const board = G.board;
+  const piece = board[move.from.r][move.from.c];
+  const targetPiece = board[move.to.r][move.to.c];
+
+  let shieldedPiece = null;
+  if (move.enPassant) {
+    const dir = color === WHITE ? 1 : -1;
+    shieldedPiece = board[move.to.r + dir][move.to.c];
+  } else if (targetPiece && targetPiece.color !== color) {
+    shieldedPiece = targetPiece;
+  }
+  if (shieldedPiece && shieldedPiece.shieldTurns > 0) {
+    shieldedPiece.shieldTurns = 0;
+    logPublic(`🛡️ ${labelColor(shieldedPiece.color)}'s Arcane Shield blocked a capture attempt!`);
+    toast('Arcane Shield blocked the capture!');
+    finishMoveAndEndTurn();
+    return;
+  }
+
+  let capturedPiece = null;
+  if (move.enPassant) {
+    const dir = color === WHITE ? 1 : -1;
+    capturedPiece = board[move.to.r + dir][move.to.c];
+    board[move.to.r + dir][move.to.c] = null;
+  } else if (targetPiece && targetPiece.color !== color) {
+    capturedPiece = targetPiece;
+  }
+
+  if (move.castle === 'K') { board[move.to.r][5] = board[move.to.r][7]; board[move.to.r][7] = null; board[move.to.r][5].hasMoved = true; }
+  if (move.castle === 'Q') { board[move.to.r][3] = board[move.to.r][0]; board[move.to.r][0] = null; board[move.to.r][3].hasMoved = true; }
+
+  piece.prevSquare = { r: move.from.r, c: move.from.c };
+  board[move.from.r][move.from.c] = null;
+  piece.hasMoved = true;
+  if (move.promotion && move.promoType) piece.type = move.promoType;
+  board[move.to.r][move.to.c] = piece;
+  G.lastMove = { pieceId: piece.id, color, from: move.from, to: move.to };
+  G.enPassant = move.doubleStep ? { r: (move.from.r + move.to.r) / 2, c: move.from.c } : null;
+
+  let desc = move.castle
+    ? `${labelColor(color)} castled ${move.castle === 'K' ? 'kingside' : 'queenside'}`
+    : `${labelColor(color)} moved ${pieceTypeName(piece.type)} ${squareName(move.from.r, move.from.c)} → ${squareName(move.to.r, move.to.c)}`;
+  if (capturedPiece) {
+    desc += ` capturing ${labelColor(capturedPiece.color)}'s ${pieceTypeName(capturedPiece.type)}`;
+    awardCapture(color, capturedPiece.type);
+    G.captured[capturedPiece.color].push({ type: capturedPiece.type, id: capturedPiece.id });
+  }
+  if (move.promotion) desc += ` (promoted to ${pieceTypeName(piece.type)})`;
+  desc += '.';
+  logPublic(desc);
+
+  checkCardSquareTrigger(move.to.r, move.to.c, piece);
+  finishMoveAndEndTurn();
+}
+
+function isSelectable(r, c) {
+  const piece = G.board[r][c];
+  if (!piece || piece.color !== G.turn || piece.isFrozenThisTurn) return false;
+  if (G.forcedKingPressure && G.forcedKingPressure.color === G.turn) {
+    const kp = findKing(G.board, G.turn);
+    if (kp) {
+      const kingMoves = legalMovesForSquare(G, kp.r, kp.c);
+      if (kingMoves.length > 0 && piece.type !== 'k') return false;
+    }
+  }
+  return true;
+}
+
+// ---------- input handlers ----------
+function onSquareClick(r, c) {
+  if (!G || G.gameOver) return;
+  if (!isHumanControlled(G.turn)) return;
+  if (G.phase === 'card' && UI.selectedCardIndex != null) handleCardTargetClick(r, c);
+  else if (G.phase === 'move') handleMoveClick(r, c);
+}
+
+function handleMoveClick(r, c) {
+  if (UI.selected) {
+    const mv = UI.legalMoves.find(m => m.to.r === r && m.to.c === c);
+    if (mv) { tryMakeMove(mv); return; }
+  }
+  if (isSelectable(r, c)) {
+    UI.selected = { r, c };
+    UI.legalMoves = legalMovesForSquare(G, r, c);
+  } else {
+    UI.selected = null; UI.legalMoves = [];
+  }
+  render();
+}
+
+function handleCardTargetClick(r, c) {
+  const color = G.turn;
+  const cardKey = G.hands[color][UI.selectedCardIndex];
+  const def = CARD_BY_KEY[cardKey];
+  if (!isValidCardTarget(color, cardKey, UI.cardTargetStage, r, c)) return;
+  if (def.targetType === 'quickMove' || def.targetType === 'twoOwnPieces') {
+    UI.cardTargetStage.push({ r, c });
+  } else {
+    UI.cardTargetStage = [{ r, c }];
+  }
+  render();
+}
+
+function onHandCardClick(idx) {
+  if (!G || G.gameOver || G.phase !== 'card' || G.cardUsedThisTurn || !isHumanControlled(G.turn)) return;
+  const color = G.turn;
+  const cardKey = G.hands[color][idx];
+  const def = CARD_BY_KEY[cardKey];
+  if (cardKey === 'rejectBarrier') { toast('Reject Barrier can only be used to counter a revealed enemy effect.'); return; }
+  if (!canPlayCard(color, cardKey)) { toast(`${def.name} has no valid target right now.`); return; }
+  UI.selectedCardIndex = idx;
+  UI.cardTargetStage = [];
+  UI.reviveChosenPiece = null;
+  if (cardKey === 'revive') showReviveModal(color);
+  render();
+}
+
+function onConfirmCard() {
+  if (!isTargetComplete()) return;
+  const color = G.turn;
+  const cardKey = G.hands[color][UI.selectedCardIndex];
+  const targets = UI.cardTargetStage.slice();
+  removeCardFromHand(color, cardKey);
+  G.cardUsedThisTurn = true;
+  logPublic(`🃏 ${labelColor(color)} played a card.`);
+  const isKP = cardKey === 'kingPressure';
+  applyCardEffect(color, cardKey, targets);
+  UI.selectedCardIndex = null; UI.cardTargetStage = []; UI.reviveChosenPiece = null;
+  if (isKP) { finishMoveAndEndTurn(); }
+  else { G.phase = 'move'; render(); }
+}
+
+function onCancelCard() {
+  UI.selectedCardIndex = null; UI.cardTargetStage = []; UI.reviveChosenPiece = null;
+  render();
+}
+
+function onSkipCard() {
+  if (!G || G.phase !== 'card' || G.gameOver || !isHumanControlled(G.turn)) return;
+  UI.selectedCardIndex = null; UI.cardTargetStage = [];
+  G.phase = 'move';
+  
